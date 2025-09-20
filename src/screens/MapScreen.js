@@ -32,6 +32,7 @@ import { BlurView } from 'expo-blur';
 
 // Environment variables (requires react-native-dotenv or similar Babel plugin)
 import { API_BASE_URL, SOCKET_URL, GOOGLE_MAPS_API_KEY } from "@env";
+import api from "../services/api"; // Axios instance configured with API_BASE_URL
 
 const { height } = Dimensions.get("window");
 
@@ -468,7 +469,7 @@ export default function MapScreen() {
 
   const [userLocation, setUserLocation] = useState(null);
   const [pickupLocation, setPickupLocation] = useState("Getting current location...");
-  const [data, setData] = useState([]);
+  const [data, setData] = useState([]); // generic container for rides/couriers
   const [selectedItem, setSelectedItem] = useState(null);
   const [courierSubMode, setCourierSubMode] = useState(
     isCourierRelated && paramMode !== "courier" ? paramMode : "send"
@@ -625,15 +626,39 @@ export default function MapScreen() {
   };
 
   const handleSelectRide = async (selectedRide) => {
-    setRideStatus('confirmed');
-    
-    // We will use the shuttleLocation from the context, which is set by the driver
-    if (userLocation && shuttleLocation) {
-      await fetchRoute(shuttleLocation, userLocation, setDriverToPickupRoute);
-      mapRef.current?.fitToCoordinates([shuttleLocation, userLocation, selectedItem.coords], {
-        edgePadding: { top: 100, right: 50, bottom: 100, left: 50 },
-        animated: true,
-      });
+    // Book ride via backend, then set confirmed & draw routes
+    try {
+      setLoading(true);
+      const body = {
+        pickup: userLocation,
+        destination: selectedItem?.coords,
+        rideOption: selectedRide?.id || selectedRide, // id or selection
+        userId: user?._id,
+      };
+
+      // POST to backend ride booking endpoint
+      // (backend should handle creating ride and returning ride data)
+      const res = await api.post("/api/rides/book", body);
+      // response expected to contain ride info; you can store it if needed
+      console.log("Ride booking response:", res.data);
+
+      setRideStatus('confirmed');
+
+      // draw driver -> pickup route if shuttleLocation is available
+      if (userLocation && shuttleLocation) {
+        await fetchRoute(shuttleLocation, userLocation, setDriverToPickupRoute);
+        if (selectedItem?.coords) {
+          mapRef.current?.fitToCoordinates([shuttleLocation, userLocation, selectedItem.coords], {
+            edgePadding: { top: 100, right: 50, bottom: 100, left: 50 },
+            animated: true,
+          });
+        }
+      }
+    } catch (err) {
+      console.error("Booking failed", err);
+      Alert.alert("Booking Error", err?.response?.data?.message || err.message || "Failed to book ride");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -655,7 +680,7 @@ export default function MapScreen() {
     }
   };
 
-  // Fetch real data from the backend
+  // Fetch real data from the backend (shuttles, rides, or couriers depending on mode)
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
@@ -663,26 +688,27 @@ export default function MapScreen() {
       try {
         let endpoint;
         if (initialMode === "shuttle") {
-            endpoint = "/api/shuttles/routes";
+            endpoint = "/api/shuttles/routes"; // expected backend route
         } else if (initialMode === "ride") {
             endpoint = "/api/rides";
         } else {
             endpoint = "/api/couriers";
         }
         
-        const res = await fetch(`${API_BASE_URL}${endpoint}`);
-        if (!res.ok) throw new Error("Failed to fetch data");
-        const jsonData = await res.json();
+        // Use axios instance
+        const res = await api.get(endpoint);
+        const jsonData = res.data;
         
         if (initialMode === "shuttle") {
-            setShuttleRoutes(jsonData.routes);
-            setShuttleBusLocations(jsonData.buses);
+            // Expecting { routes: [...], buses: [...] }
+            setShuttleRoutes(jsonData.routes || []);
+            setShuttleBusLocations(jsonData.buses || []);
         } else {
             setData(Array.isArray(jsonData) ? jsonData : []);
         }
-        
       } catch (err) {
-        setError(err.message);
+        console.error("Fetch data error:", err);
+        setError(err?.response?.data?.message || err.message || "Failed to fetch data");
       } finally {
         setLoading(false);
       }
@@ -702,7 +728,10 @@ export default function MapScreen() {
     });
 
     socket.on('bus_location_update', (data) => {
+        // Update shuttleBusLocations by matching bus IDs
         setShuttleBusLocations(prevLocations => {
+            // If prevLocations empty, push the incoming data
+            if (!prevLocations || prevLocations.length === 0) return [data];
             return prevLocations.map(bus => 
                 bus.id === data.id ? { ...bus, coords: data.coords, nextStopEta: data.nextStopEta } : bus
             );
@@ -719,6 +748,52 @@ export default function MapScreen() {
         }
     };
   }, [initialMode]);
+
+  // Courier "send" action: debounce and POST to backend when courierDestination is set
+  useEffect(() => {
+    let timer = null;
+    const sendCourier = async () => {
+      if (courierSubMode !== "send") return;
+      if (!courierDestination || courierDestination.trim().length < 3) return;
+
+      try {
+        setLoading(true);
+        const body = {
+          senderId: user?._id,
+          address: courierDestination,
+        };
+        const res = await api.post("/api/couriers/send", body);
+        console.log("Courier send response:", res.data);
+        Alert.alert("Courier Request", "Courier request created.");
+      } catch (err) {
+        console.error("Courier send error:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    // debounce 800ms after user stops typing
+    if (courierDestination && courierDestination.trim().length > 2) {
+      timer = setTimeout(sendCourier, 800);
+    }
+
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [courierDestination, courierSubMode, user]);
+
+  // Handle manual courier tracking (can be wired to a button)
+  const handleTrackCourier = async (trackingId) => {
+    try {
+      setLoading(true);
+      const res = await api.get(`/api/couriers/track/${trackingId}`);
+      Alert.alert("Tracking Info", `Status: ${res.data.status}`);
+    } catch (err) {
+      Alert.alert("Tracking Error", err?.response?.data?.message || err.message || "Failed to track");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     (async () => {
